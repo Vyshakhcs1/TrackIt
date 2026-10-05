@@ -120,9 +120,9 @@ SQLite is the source of truth for local health data. Sync uploads the local payl
 ## Key Technical Decisions
 
 - Requirements were brainstormed and the main product priorities were first captured on paper.
-- The initial UI direction was created with Google Stitch's AI designer. Connecting Stitch MCP to VS Code Copilot was considered as part of the design workflow.
+- The initial UI direction was created with Google Stitch's AI designer. Connecting <strong><u>Stitch MCP to VS Code</u></strong> Copilot was considered as part of the design workflow.
 
-    For design : `https://stitch.withgoogle.com/projects/9808366889060079459`
+   Design: [Created App Design](https://stitch.withgoogle.com/projects/9808366889060079459)
 - A skeleton data-source structure was created before feature data was integrated, keeping UI, ViewModel, model, and repository responsibilities separate.
 - Redux Toolkit was selected for active session state; SQLite was added for per-user durable/offline health data.
 
@@ -197,7 +197,7 @@ Separation of concerns: We are using MVVM. MVVM separates the screen from the lo
 #### Implementation Summary and Design Decisions:
 
 What you implemented : 
-* Created a complete UI design with google stitch & MCP.
+* Created a complete UI design with <strong><u>Google Stitch &amp; MCP</u></strong>.
 * Mocked API using Mockoon stand alone tool.
 * Created a Today screen showing health metrics such as steps, water, sleep, and weight, along with daily goals and progress.
 * Created an Analytics screen with charts for health metrics over different time periods.
