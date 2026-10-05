@@ -31,6 +31,7 @@ export function LoginScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <ScrollView
+          contentContainerStyle={styles.scrollContent}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
@@ -112,8 +113,7 @@ export function LoginScreen() {
 
               {auth.error ? <Text style={styles.loginError}>{auth.error}</Text> : null}
               <PrimaryButton
-                title={auth.status === 'signingIn' ? 'Signing In…' : 'Sign In to Health Vault'}
-                trailingSymbol="→"
+                title={auth.status === 'signingIn' ? 'Signing In…' : 'Sign In'}
                 disabled={auth.status === 'signingIn'}
                 onPress={signIn}
               />
@@ -174,6 +174,7 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+    justifyContent: 'center',
     paddingHorizontal: 16,
     paddingTop: 8,
   },
@@ -292,7 +293,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.8,
   },
   createVault: {
-    marginTop: 'auto',
+    marginTop: 12,
     paddingTop: 12,
     color: '#45464D',
     fontFamily: 'Manrope',

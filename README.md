@@ -2,13 +2,23 @@
 
 TrackIt is a React Native health tracker. It uses a local SQLite database as the durable source for health data, Redux Toolkit for active application state, and an HTTP API for login, initial data loading, and synchronization.
 
+<!-- ![TrackIt Screenshot](./src/shared/assets/1.png) -->
+
+<p>
+  <img src="./src/shared/assets/1.png" width="150" height="310">
+  <img src="./src/shared/assets/2.png" width="150" height="310">
+  <img src="./src/shared/assets/3.png" width="150" height="310">
+  <img src="./src/shared/assets/4.png" width="150" height="310">
+  <img src="./src/shared/assets/5.png" width="150" height="310">
+</p>
+
 ## Features
 
 - Today dashboard for daily goals, water, sleep, weight, and other metrics.
 - Analytics charts for weight, steps, water, sleep, and calories.
 - Weight measurement logging with pending/synced status.
-- Per-user SQLite persistence and an offline outbox.
-- Manual Sync Now and an optional per-user Auto-sync setting.
+- Per user SQLite persistence and an offline outbox.
+- Manual Sync Now and an optional per user Auto sync setting.
 - Session restoration.
 
 ## Requirements
@@ -66,10 +76,10 @@ TrackIt uses **MVVM with clear separation of concerns**:
 
 - **Views** render screens and forward user actions.
 - **ViewModels** coordinate feature behavior and expose display-ready state.
-- **Models** define the health-data and authentication contracts.
+- **Models** define the health data and authentication contracts.
 - **Data/Repositories** isolate Mockoon API, SQLite, and session-storage access.
 
-Redux holds active session state; SQLite is the durable local health-data source.
+Redux holds active session state; SQLite is the durable local health data source.
 
 ```mermaid
 flowchart LR
@@ -83,8 +93,8 @@ flowchart LR
 
 ### State Management
 
-- Redux Toolkit stores authentication/session state and the active user's `today`, `analytics`, `logMetric`, and pending-sync count.
-- ViewModels coordinate user actions, repository calls, and presentation-ready values.
+- Redux Toolkit stores authentication/session state and the active user's `today`, `analytics`, `logMetric`, and pending sync count.
+- ViewModels coordinate user actions, repository calls, and presentation ready values.
 - Views render ViewModel/Redux state and pass user actions back to the ViewModels.
 
 ### Local Persistence
@@ -105,7 +115,7 @@ SQLite stores health data scoped by `user_id`. The main tables are:
 
 ## Offline and Synchronization
 
-- On first health-data load for a user with no local SQLite data, the app calls `GET /fetchAllData` with that user's `x-user-id`, normalizes the response, and persists it.
+- On first health data load for a user with no local SQLite data, the app calls `GET /fetchAllData` with that user's `x-user-id`, normalizes the response, and persists it.
 - For a user with local data, reads come from SQLite. This avoids replacing offline edits with a fresh server snapshot on every launch.
 - Water and weight changes are persisted locally and queued in `sync_outbox` before Redux is updated.
 - Sync Now and Auto-sync use the same service. Auto-sync is an optional per-user setting stored in AsyncStorage and runs while the app is active, online, and has pending changes.
@@ -169,7 +179,7 @@ npm run lint
 - Look into manage years of data to show over UI.
 
 ## Thoughts
-Suggestion to conflict resolution: Keep conflicted operations queued and let the app apply a clear policy: keep the server value, keep the local value, or let the user decide. Don’t resolve health-data conflicts just by comparing timestamps.
+Suggestion to conflict resolution: Keep conflicted operations queued and let the app apply a clear policy: keep the server value, keep the local value, or let the user decide. Don’t resolve health data conflicts just by comparing timestamps.
 
 For maintaining idempotency: Create the ID once when you queue a change, save it in SQLite, and reuse that saved ID every time you retry. Never generate a new ID for a retry.
 
@@ -179,7 +189,7 @@ Keep all raw health records in SQLite, but don’t load years of records into Ja
     Handling error scenarios:
     Initial loading: Today, Analytics, and Log Metric show a spinner until their health data is available. Health data is loaded from SQLite; if that user has no local data yet, the app fetches it from the API and saves it locally.
 
-    API failure: If initial health-data loading fails, the error is shown instead of the screen content. Login failures also show an error. 
+    API failure: If initial health data loading fails, the error is shown instead of the screen content. Login failures also show an error. 
 
     Failed synchronization: The app shows an alert and keeps queued changes on the device for a later retry. Offline sync attempts also show an alert.
 
