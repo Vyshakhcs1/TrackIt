@@ -2,8 +2,84 @@ import { open, type DB } from '@op-engineering/op-sqlite';
 
 export type HealthDbTransaction = Parameters<Parameters<DB['transaction']>[0]>[0];
 
-const currentSchemaVersion = 2;
+const currentSchemaVersion = 4;
 let databasePromise: Promise<DB> | null = null;
+
+export async function createConflictTables(
+  transaction: HealthDbTransaction,
+): Promise<void> {
+  await transaction.execute(`
+    CREATE TABLE IF NOT EXISTS sync_conflicts (
+      user_id TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('weight', 'water')),
+      record_date TEXT NOT NULL,
+      local_operation TEXT NOT NULL CHECK (local_operation IN ('upsert', 'delete')),
+      local_value REAL,
+      local_note TEXT,
+      local_measured_at TEXT,
+      server_value REAL,
+      server_note TEXT,
+      server_measured_at TEXT,
+      server_deleted INTEGER NOT NULL DEFAULT 0,
+      server_version TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, record_id)
+    )
+  `);
+  await transaction.execute(`
+    CREATE TABLE IF NOT EXISTS server_sync_state (
+      user_id TEXT PRIMARY KEY NOT NULL,
+      cursor TEXT
+    )
+  `);
+}
+
+export async function createDeviceHealthTables(
+  transaction: HealthDbTransaction,
+): Promise<void> {
+  await transaction.execute(`
+    CREATE TABLE IF NOT EXISTS device_daily_metrics (
+      user_id TEXT NOT NULL,
+      metric_key TEXT NOT NULL CHECK (metric_key IN ('steps', 'sleep', 'calories')),
+      record_date TEXT NOT NULL,
+      value REAL NOT NULL,
+      deep_minutes REAL,
+      rem_minutes REAL,
+      light_minutes REAL,
+      awake_minutes REAL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, metric_key, record_date)
+    )
+  `);
+  await transaction.execute(`
+    CREATE TABLE IF NOT EXISTS device_sync_state (
+      user_id TEXT PRIMARY KEY NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 0,
+      synced_revision INTEGER NOT NULL DEFAULT 0,
+      backfilled_days INTEGER NOT NULL DEFAULT 0,
+      last_imported_at TEXT
+    )
+  `);
+  await transaction.execute(`
+    CREATE TABLE IF NOT EXISTS health_connect_writeback (
+      operation_id TEXT PRIMARY KEY NOT NULL,
+      user_id TEXT NOT NULL,
+      record_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('weight', 'water')),
+      operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+      created_at TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    )
+  `);
+  await transaction.execute(
+    'CREATE INDEX IF NOT EXISTS idx_device_daily_metrics_user_date ON device_daily_metrics(user_id, record_date)',
+  );
+  await transaction.execute(
+    'CREATE INDEX IF NOT EXISTS idx_health_connect_writeback_user_created ON health_connect_writeback(user_id, created_at)',
+  );
+}
 
 export async function createHealthSchemaV2(
   transaction: HealthDbTransaction,
@@ -151,6 +227,8 @@ async function initializeDatabase(): Promise<DB> {
   if (version === 0) {
     await database.transaction(async transaction => {
       await createHealthSchemaV2(transaction);
+      await createDeviceHealthTables(transaction);
+      await createConflictTables(transaction);
       await transaction.execute(`PRAGMA user_version = ${currentSchemaVersion}`);
     });
   }

@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { AppState } from 'react-native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useNetInfo } from '@react-native-community/netinfo';
@@ -18,7 +19,9 @@ import {
   syncQueueCountChanged,
 } from '../store/slices/healthDataSlice';
 import { readAutoSyncEnabled } from '../../shared/data/autoSyncPreferenceStorage';
-import { syncPendingHealthData } from '../../shared/data/healthSyncService';
+import { syncPendingHealthData, pullServerChanges } from '../../shared/data/healthSyncService';
+import { loadHealthDataForUser } from '../../shared/data/healthDataRepository';
+import { useHealthConnect } from '../../shared/health/useHealthConnect';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
 
@@ -42,6 +45,47 @@ export function MainTabNavigator() {
   const network = useNetInfo();
   const isOnline = network.isConnected === true && network.isInternetReachable !== false;
   const userId = authUser?.id;
+  const { refresh: refreshHealthConnect } = useHealthConnect();
+
+  useEffect(() => {
+    if (!userId || status !== 'succeeded') {
+      return;
+    }
+    refreshHealthConnect();
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        refreshHealthConnect();
+      }
+    });
+    return () => subscription.remove();
+  }, [refreshHealthConnect, status, userId]);
+
+  useEffect(() => {
+    if (!authUser || !isOnline || status !== 'succeeded') {
+      return;
+    }
+    let active = true;
+    const pull = async () => {
+      if (!(await pullServerChanges(authUser)) || !active) {
+        return;
+      }
+      const loaded = await loadHealthDataForUser(authUser);
+      if (active) {
+        dispatch(healthDataLoadSucceeded(loaded.payload));
+        dispatch(syncQueueCountChanged(loaded.pendingCount));
+      }
+    };
+    pull().catch(() => undefined);
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        pull().catch(() => undefined);
+      }
+    });
+    return () => {
+      active = false;
+      subscription.remove();
+    };
+  }, [authUser, dispatch, isOnline, status]);
 
   useEffect(() => {
     if (!userId) {

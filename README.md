@@ -1,6 +1,6 @@
 # TrackIt Health Tracker
 
-TrackIt is a React Native health tracker. It uses a local SQLite database as the durable source for health data, Redux Toolkit for active application state, and an HTTP API for login, initial data loading, and synchronization.
+TrackIt is a React Native health tracker with Android Health Connect integration for importing steps, sleep, and active calories, and writing weight and hydration data. It uses a local SQLite database as the durable source for health data, Redux Toolkit for active application state, and an HTTP API for login, initial data loading, and synchronization.
 
 <!-- ![TrackIt Screenshot](./src/shared/assets/1.png) -->
 
@@ -16,10 +16,12 @@ TrackIt is a React Native health tracker. It uses a local SQLite database as the
 
 - Today dashboard for daily goals, water, sleep, weight, and other metrics.
 - Analytics charts for weight, steps, water, sleep, and calories.
-- Weight measurement logging with pending/synced status.
-- Per user SQLite persistence and an offline outbox.
-- Manual Sync Now and an optional per user Auto sync setting.
-- Session restoration.
+- Android Health Connect integration to import steps, sleep, and active calories, and write back weight and hydration records.
+- Add, edit, and delete weight measurements, with pending/synced status.
+- Per-user SQLite persistence and an offline outbox for weight and water changes.
+- Manual Sync Now, optional per-user Auto sync while the app is active, and retries for transient HTTP failures.
+- Version-based sync conflict detection with user choices to keep the local value or use the server value.
+- Session restoration and per-user local health data.
 
 ## Requirements
 
@@ -77,9 +79,9 @@ TrackIt uses **MVVM with clear separation of concerns**:
 - **Views** render screens and forward user actions.
 - **ViewModels** coordinate feature behavior and expose display-ready state.
 - **Models** define the health data and authentication contracts.
-- **Data/Repositories** isolate Mockoon API, SQLite, and session-storage access.
+- **Data/Repositories** isolate the API, SQLite, session storage, and Health Connect access.
 
-Redux holds active session state; SQLite is the durable local health data source.
+Redux holds active application state; SQLite is the durable local health data source. The Health Connect provider imports device metrics into SQLite and writes app-managed weight and hydration changes back to Health Connect.
 
 ```mermaid
 flowchart LR
@@ -89,6 +91,9 @@ flowchart LR
    Repositories <--> SQLite[(Local SQLite)]
    Repositories <--> API[Mockoon API]
    Repositories <--> Session[AsyncStorage session]
+   HealthConnect[Health Connect] <--> HealthServices[Health Connect provider and sync services]
+   HealthServices <--> SQLite
+   Repositories --> HealthServices
 ```
 
 ### State Management
@@ -111,21 +116,35 @@ SQLite stores health data scoped by `user_id`. The main tables are:
 
 ## Health and Device Integration
 
-**Not implemented.** The app does not currently read from Apple HealthKit, Android Health Connect, wearable sensors, or device health APIs. Health data currently comes from the backend response and local user edits.
+TrackIt integrates with **Android Health Connect** through `react-native-health-connect`. This integration is Android-only; Apple HealthKit is not implemented.
+
+- **Reads:** daily steps, active calories, and sleep sessions. Sleep sessions are grouped by wake date, duplicate sessions are de-duplicated, and available stage durations (deep, REM, light, and awake) are summarized.
+- **Writes:** logged weight measurements and daily water totals are written to Health Connect when the corresponding write permission is granted.
+- **Permissions:** access is requested for steps, sleep, and active calories (read), weight and hydration (write), and historical health data (read). Users can grant only some permissions; the app reports partial access and imports the metrics it can read.
+- **Import window:** with historical-data access, the initial backfill covers up to 90 days; without it, up to 30 days. Later refreshes cover the most recent 7 days. Imports are stored per user in SQLite and refresh when the main tabs load and when the app returns to the foreground.
+- **Display:** imported steps, sleep, and calories populate Today and Analytics. Sleep is stored in minutes and shown in hours in Analytics. Weight and water continue to use the app's local/server data and are not replaced by device imports.
+- **Write-back queue:** weight and water writes are queued locally and retried on later flushes after failures. The same client record ID is reused for a queued operation to reduce duplicate writes.
+
+Health Connect must be available and the requested permissions must be granted for device data to appear. Device health integration is not an OS-managed background task; refreshes are initiated while the app is active.
 
 ## Offline and Synchronization
 
 - On first health data load for a user with no local SQLite data, the app calls `GET /fetchAllData` with that user's `x-user-id`, normalizes the response, and persists it.
 - For a user with local data, reads come from SQLite. This avoids replacing offline edits with a fresh server snapshot on every launch.
-- Water and weight changes are persisted locally and queued in `sync_outbox` before Redux is updated.
-- Sync Now and Auto-sync use the same service. Auto-sync is an optional per-user setting stored in AsyncStorage and runs while the app is active, online, and has pending changes.
-- Sync sends the SQLite-backed health payload to `POST /syncLocalToServer` with `x-user-id`.
-- The outbox is acknowledged only after a successful HTTP response. Changes made during an in-flight upload remain queued if they were not part of that upload's outbox snapshot.
-- Offline changes remain on-device and queued until a later successful sync.
+- Weight and water changes are committed to SQLite and queued in `sync_outbox` before Redux is updated. Health Connect write-backs for weight and water use a separate persistent queue and can be flushed again after a failure.
+- Sync Now and Auto-sync use the same per-user sync service. Auto-sync is an optional per-user setting stored in AsyncStorage; it runs while the app is active, connected, and has pending changes. Server changes are also pulled when the app becomes active.
+- Uploads send the SQLite-backed health payload and per-record changes to `POST /syncLocalToServer` with the user's `x-user-id`. The outbox snapshot is acknowledged only after a successful response; newer edits made during an upload remain queued.
+- The app pulls incremental server updates from `GET /fetchChanges`, using a saved per-user cursor. A failed pull is best effort and does not discard an upload that already succeeded.
+- Transient network failures, timeouts, and selected HTTP statuses (`408`, `425`, `429`, and `5xx`) are retried up to two times with exponential backoff and jitter. Other client errors are not retried.
+- Offline changes remain on-device and queued until a later successful sync. Initial data loading for a new local user requires the server to be reachable.
 
 ## Conflict Resolution
 
-SQLite is the source of truth for local health data. Sync uploads the local payload when changes are pending and keeps those changes queued if the request fails.
+SQLite is the durable source of truth for local health data. Each queued weight or water change includes the server version it was based on. During sync, per-record server results are used to acknowledge accepted changes, keep rejected or unanswered changes queued, and store conflicts that include both the local edit and the server state.
+
+Pulled server changes are applied when there is no pending local edit. If a local edit is pending and its version differs from the server version, the app preserves both versions as an open conflict instead of silently overwriting the local edit. Repeated server changes update the server side of an existing conflict.
+
+Users can resolve an open conflict by choosing **Keep mine** or **Use server**. Keeping the local value re-queues it against the latest server version; choosing the server value applies that state locally. Failed sync requests leave queued changes available for a later retry. Conflict resolution is implemented for weight and water records.
 
 ## Key Technical Decisions
 
@@ -135,63 +154,55 @@ SQLite is the source of truth for local health data. Sync uploads the local payl
    Design: [Created App Design](https://stitch.withgoogle.com/projects/9808366889060079459)
 - A skeleton data-source structure was created before feature data was integrated, keeping UI, ViewModel, model, and repository responsibilities separate.
 - Redux Toolkit was selected for active session state; SQLite was added for per-user durable/offline health data.
+- Android Health Connect was selected as the device health data source for importing steps, sleep, and active calories, with write-back support for weight and hydration. The integration is Android-only; HealthKit support is outside the current platform scope.
 
 ## Testing and Quality Checks
 
-Focused tests currently cover:
+The Jest suite currently includes focused tests for:
 
-- `__tests__/authRepository.test.ts`: successful login request/response and server-provided invalid-credentials error.
-- `__tests__/healthSyncService.test.ts`: failed sync leaves queued changes untouched; successful sync acknowledges only the submitted operations.
+- `__tests__/App.test.tsx`: basic app rendering.
+- `__tests__/authRepository.test.ts`: successful login and server-provided invalid-credentials errors.
+- `__tests__/deviceMetricsOverlay.test.ts`: device metrics replacing the supported Today and Analytics values, including ranges and placeholders.
+- `__tests__/healthSyncService.test.ts`: failed uploads retaining queued changes, acknowledgement of uploaded changes, and recording conflicts.
+- `__tests__/httpRetry.test.ts`: retrying transient failures, skipping client errors, and stopping after the retry limit.
+- `__tests__/sleepNormalizer.test.ts`: sleep wake-date assignment, stage summaries, duplicate sessions, and sessions without stages.
+- `__tests__/syncConflicts.test.ts`: per-record sync result partitioning and decisions for applying, ignoring, or conflicting server changes.
 
-Run an individual test file from the project root:
+Run the complete suite from the project root:
 
 ```sh
-npm test -- --runInBand __tests__/authRepository.test.ts
-npm test -- --runInBand __tests__/healthSyncService.test.ts
+npm test -- --runInBand
 ```
 
-Run static checks:
+Run the TypeScript and lint checks from the project root:
 
 ```sh
 npx tsc --noEmit
 npm run lint
 ```
 
+The current tests focus on selected logic and mocked sync behavior. They do not exercise Health Connect on a device, SQLite persistence and migrations, or the full conflict-resolution flow against a backend.
+
 ## Performance Considerations
 
-- Add SQLite indexes and group related writes in transactions.
-- Health data is hydrated into Redux for the active session, so switching tabs uses in-memory state rather than repeating API or database loads.
-
-## Trade-offs
-
-- Full-payload sync simplifies the API contract but sends unchanged sections along with locally changed values.
-- Auto-sync is simple to operate while the app is open, but does not run as an OS background task after the app is terminated.
+- SQLite queries are supported by indexes on user/metric/date and outbox ordering. Related local edits, device imports, and conflict updates are grouped in transactions.
+- Health Connect imports are limited to a 90-day initial backfill (30 days without history permission) and then a 7-day rolling refresh. Imported rows are written in 30-day chunks; sleep-session reads use paginated requests.
+- Per-user sync and device refresh work is coalesced while an operation is already in flight. Health data is hydrated into Redux for the active session, so tab changes can reuse loaded state without repeating database or API reads.
+- Analytics currently builds bounded 7-, 30-, and 90-day device metric ranges. Large measurement histories and the full-payload sync request can still grow with user data; loading chart ranges and syncing only changed records are future optimization opportunities.
 
 ## Known Limitations
 
 - First login/data initialization requires network access. Explicit logout clears the session, so signing in again also requires network access; that user's local SQLite data is retained.
-- Add Health Connect/HealthKit integration, OS-managed background sync, focused database migration tests, and targeted Analytics/per-write performance improvements.
-- Auto-sync is simple to operate while the app is open, but does not run as an OS background task after the app is terminated.
+
+- Auto-sync does not run as an OS background task after the app is terminated.
 
 ## What you would improve with more time
-- Handle scenarios of same user logs in different device and updates the data.
 - Update only the required changed value for sync operation.
-- Look into manage years of data to show over UI.
 
 ## Thoughts
-Suggestion to conflict resolution: Keep conflicted operations queued and let the app apply a clear policy: keep the server value, keep the local value, or let the user decide. Don’t resolve health data conflicts just by comparing timestamps.
-
-For maintaining idempotency: Create the ID once when you queue a change, save it in SQLite, and reuse that saved ID every time you retry. Never generate a new ID for a retry.
 
 Performance:
 Keep all raw health records in SQLite, but don’t load years of records into JavaScript or Redux just to draw a chart. Load only a summary for the selected metric and date range. WHere all possible use Pagination if possible if the data length is more.
-
-    Handling error scenarios:
-    Initial loading: Today, Analytics, and Log Metric show a spinner until their health data is available. Health data is loaded from SQLite; if that user has no local data yet, the app fetches it from the API and saves it locally.
-
-    API failure: If initial health data loading fails, the error is shown instead of the screen content. Login failures also show an error. 
-
-    Failed synchronization: The app shows an alert and keeps queued changes on the device for a later retry. Offline sync attempts also show an alert.
 
 Architectural Decisions:
 Redux Toolkit: Health and session state is shared across Today, Analytics, and Log Metric. Redux keeps that state and its updates in one predictable place, without passing it through every screen. SQLite still stores health data permanently; Redux holds the current app state.
@@ -215,9 +226,10 @@ What you implemented :
 * Added login and load the user’s health data from the API.
 * Saved health data on the device, so users can view and update it offline.
 * Added manual sync and optional auto-sync to send local changes to the server when online.
+* Integrated Android Health Connect to import steps, sleep, and active calories, and write logged weight and hydration data back when permissions are granted.
 
 What you partially implemented : 
-* Updation and syncing of only weight & water metrics. Remaining metrics are pending.
+* Editing of only weight & water metrics. Remaining metrics can be promoted for editing.
 
 What you designed but did not implement: 
 * Better error views,
@@ -225,16 +237,12 @@ What you designed but did not implement:
 * light & dark mode switching
 
 What you would implement next:
-* Allowing edit option for all the metrics,
-* Multi user concurrent usage(same time different devices) conflict resolution,
 * Manage large data set(pagination where all is possible)
 * Manage app life cycle
-* Integrate health fitness data from external data provider. 
-* Api retry logic
 
 Any assumptions you made:
-* Initial setup needs a network connection. A new user’s health data must be fetched before local use can begin.
+* Initial setup needs a network connection for first time login. A new user’s health data must be fetched before local use can begin.
 
 Any trade-offs you made:
 * Full-payload sync simplifies the API contract but sends unchanged sections along with locally changed values
-* Auto-sync is simple to operate while the app is open, but does not run as an OS background task after the app is terminated.
+* Sync does not run as an OS background task after the app is terminated.

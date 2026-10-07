@@ -15,6 +15,8 @@ import {
   saveUserHealthDataChange,
 } from '../../../../shared/data/healthDataRepository';
 import { syncPendingHealthData } from '../../../../shared/data/healthSyncService';
+import { useHealthConnect } from '../../../../shared/health/useHealthConnect';
+import { useSyncConflicts } from '../../../../shared/data/useSyncConflicts';
 import type { TodayGoalMetric } from '../../domain/models/TodayData';
 
 const goalLabels: Record<TodayGoalMetric, string> = {
@@ -88,6 +90,8 @@ export function useTodayViewModel() {
     loadStateRef.current = { userId: currentUserId, inFlight: false, settled: false };
   }
   const latestWeight = useAppSelector(selectCurrentWeight);
+  const healthConnect = useHealthConnect();
+  const syncConflicts = useSyncConflicts();
   const network = useNetInfo();
   const isOnline = network.isConnected === true && network.isInternetReachable !== false;
 
@@ -261,6 +265,13 @@ export function useTodayViewModel() {
       const result = await syncPendingHealthData(authUser);
       dispatch(healthDataLoadSucceeded(result.loaded.payload));
       dispatch(syncQueueCountChanged(result.loaded.pendingCount));
+      if (result.conflictCount) {
+        Alert.alert(
+          'Review needed',
+          'Some changes conflict with newer data on the server. Choose which version to keep.',
+        );
+        return;
+      }
       if (!result.uploadedCount) {
         Alert.alert('Already synced', 'There are no pending changes to upload.');
         return;
@@ -282,6 +293,11 @@ export function useTodayViewModel() {
     data,
     status,
     error,
+    healthConnectStatus: healthConnect.status,
+    connectHealthConnect: healthConnect.connect,
+    syncConflict: syncConflicts.conflicts[0] ?? null,
+    syncConflictCount: syncConflicts.conflicts.length,
+    resolveSyncConflict: syncConflicts.resolve,
     dateWithYear: data ? formatDate(data.date, true) : '',
     dateWithoutYear: data ? formatDate(data.date, false) : '',
     goalRows,

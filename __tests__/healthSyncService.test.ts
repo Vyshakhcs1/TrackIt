@@ -7,11 +7,16 @@ import type {
 
 jest.mock('../src/shared/data/healthDataRepository', () => ({
   acknowledgePendingChanges: jest.fn(),
+  applyServerChanges: jest.fn(),
   getPendingSyncChanges: jest.fn(),
+  getServerCursor: jest.fn(),
+  getSyncChangeDetails: jest.fn(),
   loadHealthDataForUser: jest.fn(),
+  recordSyncConflicts: jest.fn(),
 }));
 
 jest.mock('../src/shared/api/healthDataApi', () => ({
+  getServerChanges: jest.fn(),
   syncHealthData: jest.fn(),
 }));
 
@@ -19,7 +24,9 @@ import { syncHealthData } from '../src/shared/api/healthDataApi';
 import {
   acknowledgePendingChanges,
   getPendingSyncChanges,
+  getSyncChangeDetails,
   loadHealthDataForUser,
+  recordSyncConflicts,
 } from '../src/shared/data/healthDataRepository';
 import { syncPendingHealthData } from '../src/shared/data/healthSyncService';
 
@@ -83,6 +90,7 @@ describe('syncPendingHealthData', () => {
     jest.clearAllMocks();
     jest.mocked(getPendingSyncChanges).mockResolvedValue(pendingChanges);
     jest.mocked(loadHealthDataForUser).mockResolvedValue(loaded);
+    jest.mocked(getSyncChangeDetails).mockResolvedValue([]);
   });
 
   it('keeps pending changes queued when the sync request fails', async () => {
@@ -95,12 +103,13 @@ describe('syncPendingHealthData', () => {
 
   it('acknowledges only the operations included in the successful request', async () => {
     const acknowledged: LoadedHealthData = { payload, pendingCount: 0 };
-    jest.mocked(syncHealthData).mockResolvedValue(undefined);
+    jest.mocked(syncHealthData).mockResolvedValue({});
     jest.mocked(acknowledgePendingChanges).mockResolvedValue(acknowledged);
 
     await expect(syncPendingHealthData(user)).resolves.toEqual({
       loaded: acknowledged,
       uploadedCount: pendingChanges.length,
+      conflictCount: 0,
     });
 
     expect(syncHealthData).toHaveBeenCalledWith(user.id, expect.objectContaining({
@@ -110,7 +119,36 @@ describe('syncPendingHealthData', () => {
           expect.objectContaining({ id: 'weight-unchanged', syncStatus: false }),
         ]),
       }),
-    }));
-    expect(acknowledgePendingChanges).toHaveBeenCalledWith(user.id, pendingChanges);
+    }), []);
+    expect(acknowledgePendingChanges).toHaveBeenCalledWith(user.id, pendingChanges, expect.any(Map));
+  });
+
+  it('keeps conflicted changes out of the acknowledgement and stores them for review', async () => {
+    const serverState = { value: 71.2, deleted: false };
+    const acknowledged: LoadedHealthData = { payload, pendingCount: 0 };
+    jest.mocked(syncHealthData).mockResolvedValue({
+      results: [
+        { recordId: 'weight-1', status: 'accepted', version: 'v7' },
+        { recordId: 'weight-2', status: 'conflict', version: 'v9', server: serverState },
+      ],
+    });
+    jest.mocked(acknowledgePendingChanges).mockResolvedValue(acknowledged);
+
+    await expect(syncPendingHealthData(user)).resolves.toMatchObject({
+      uploadedCount: 1,
+      conflictCount: 1,
+    });
+
+    expect(recordSyncConflicts).toHaveBeenCalledWith(user.id, [
+      expect.objectContaining({
+        change: pendingChanges[1],
+        result: expect.objectContaining({ recordId: 'weight-2', version: 'v9' }),
+      }),
+    ]);
+    expect(acknowledgePendingChanges).toHaveBeenCalledWith(
+      user.id,
+      [pendingChanges[0]],
+      new Map([['weight-1', 'v7']]),
+    );
   });
 });

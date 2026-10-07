@@ -26,6 +26,10 @@
                 {
                     "type": "route",
                     "uuid": "c7696376-d9bd-4afc-ac4e-5117bd0524c7"
+                },
+                {
+                    "type": "route",
+                    "uuid": "d9e2b7a1-3c4f-4e8a-b6d2-71a5c0f93e42"
                 }
             ]
         }
@@ -210,8 +214,40 @@
             "endpoint": "syncLocalToServer",
             "responses": [
                 {
+                    "uuid": "a3c1f2d4-6b7e-4c1a-9d55-2f0e8b7a1c11",
+                    "body": "{\n  \"status\": \"conflict\",\n  \"results\": [\n    {\n      \"recordId\": \"{{body 'sync.changes.0.recordId'}}\",\n      \"status\": \"conflict\",\n      \"version\": \"server-v2\",\n      \"server\": {\n        \"value\": {{#if (eq (body 'sync.changes.0.kind') 'water')}}2250{{else}}71.2{{/if}},\n        \"note\": \"Edited on another device\",\n        \"measuredAt\": null,\n        \"deleted\": false\n      }\n    }\n  ]\n}",
+                    "latency": 0,
+                    "statusCode": 200,
+                    "label": "Sample conflict: add the word conflict to a weight note",
+                    "headers": [
+                        {
+                            "key": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ],
+                    "bodyType": "INLINE",
+                    "filePath": "",
+                    "databucketID": "",
+                    "sendFileAsBody": false,
+                    "rules": [
+                        {
+                            "target": "body",
+                            "modifier": "sync.changes.0.note",
+                            "value": "conflict",
+                            "invert": false,
+                            "operator": "regex_i"
+                        }
+                    ],
+                    "rulesOperator": "OR",
+                    "disableTemplating": false,
+                    "fallbackTo404": false,
+                    "default": false,
+                    "crudKey": "id",
+                    "callbacks": []
+                },
+                {
                     "uuid": "5f6005c5-189f-4e1c-af1d-145c1fe89c3f",
-                    "body": "{{setGlobalVar (concat 'user_' (header 'x-user-id')) (bodyRaw)}}\n{\n  \"status\": \"success\",\n  \"message\": \"All data structures updated successfully.\"\n}",
+                    "body": "{{setGlobalVar (concat 'user_' (header 'x-user-id')) (bodyRaw)}}\n{\n  \"status\": \"success\",\n  \"results\": [{{#each (body 'sync.changes')}}{\"recordId\": \"{{this.recordId}}\", \"status\": \"accepted\", \"version\": \"v{{now 'T'}}\"}{{#unless @last}},{{/unless}}{{/each}}]\n}",
                     "latency": 0,
                     "statusCode": 200,
                     "label": "",
@@ -247,6 +283,42 @@
                     "statusCode": 200,
                     "label": "",
                     "headers": [],
+                    "bodyType": "INLINE",
+                    "filePath": "",
+                    "databucketID": "",
+                    "sendFileAsBody": false,
+                    "rules": [],
+                    "rulesOperator": "OR",
+                    "disableTemplating": false,
+                    "fallbackTo404": false,
+                    "default": true,
+                    "crudKey": "id",
+                    "callbacks": []
+                }
+            ],
+            "responseMode": null,
+            "streamingMode": null,
+            "streamingInterval": 0
+        },
+        {
+            "uuid": "d9e2b7a1-3c4f-4e8a-b6d2-71a5c0f93e42",
+            "type": "http",
+            "documentation": "Changes made on other devices since the cursor. Edit the body to simulate a server-side change, for example a weight entry with a newer version.",
+            "method": "get",
+            "endpoint": "fetchChanges",
+            "responses": [
+                {
+                    "uuid": "8b4d6c20-9f1a-4a3e-8c57-0d2e5f7a9b63",
+                    "body": "{\n  \"cursor\": \"1\",\n  \"changes\": []\n}",
+                    "latency": 0,
+                    "statusCode": 200,
+                    "label": "",
+                    "headers": [
+                        {
+                            "key": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ],
                     "bodyType": "INLINE",
                     "filePath": "",
                     "databucketID": "",

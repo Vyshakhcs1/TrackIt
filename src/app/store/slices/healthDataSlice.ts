@@ -6,6 +6,7 @@ import type {
   WeightMeasurement,
 } from '../../../features/metrics/domain/models/LogMetricData';
 import type { HealthDataPayload } from '../../../shared/data/HealthDataPayload';
+import type { HealthConnectStatus } from '../../../shared/health/healthConnectTypes';
 
 type HealthDataLoadStatus = 'idle' | 'loading' | 'succeeded' | 'failed';
 
@@ -15,6 +16,7 @@ export interface HealthDataState {
   analytics: AnalyticsData | null;
   pendingSyncCount: number;
   autoSyncEnabled: boolean;
+  healthConnectStatus: HealthConnectStatus;
   status: HealthDataLoadStatus;
   error: string | null;
 }
@@ -25,6 +27,7 @@ const initialState: HealthDataState = {
   analytics: null,
   pendingSyncCount: 0,
   autoSyncEnabled: false,
+  healthConnectStatus: 'unknown',
   status: 'idle',
   error: null,
 };
@@ -53,6 +56,9 @@ const healthDataSlice = createSlice({
     },
     autoSyncPreferenceChanged(state, action: PayloadAction<boolean>) {
       state.autoSyncEnabled = action.payload;
+    },
+    healthConnectStatusChanged(state, action: PayloadAction<HealthConnectStatus>) {
+      state.healthConnectStatus = action.payload;
     },
     healthDataCleared() {
       return initialState;
@@ -166,6 +172,7 @@ function getLatestWeight(
 
 export const {
   healthDataLoadFailed,
+  healthConnectStatusChanged,
   healthDataCleared,
   healthDataLoadStarted,
   healthDataLoadSucceeded,

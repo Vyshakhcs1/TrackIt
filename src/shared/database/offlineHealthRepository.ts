@@ -17,7 +17,26 @@ import type {
 } from '../../features/metrics/domain/models/LogMetricData';
 import { getAllHealthData } from '../api/healthDataApi';
 import type { HealthDataPayload } from '../data/HealthDataPayload';
+import { decideServerChange, deviceChangeRecordId } from '../data/syncConflicts';
+import type {
+  ConflictChoice,
+  ServerChange,
+  ServerChangesResponse,
+  ServerRecordState,
+  SyncChange,
+  SyncConflictItem,
+  SyncRecordKind,
+  SyncRecordResult,
+} from '../data/syncContract';
+import { applyDeviceMetrics, deviceHistoryStartDate } from '../health/deviceMetricsOverlay';
+import type {
+  DeviceDailyValue,
+  DeviceMetricKey,
+  DeviceMetricRow,
+} from '../health/healthConnectTypes';
 import {
+  createConflictTables,
+  createDeviceHealthTables,
   createHealthSchemaV2,
   getHealthDatabase,
   type HealthDbTransaction,
@@ -594,10 +613,26 @@ async function getReadyDatabase(): Promise<DB> {
   if (!schemaReadyPromise) {
     schemaReadyPromise = (async () => {
       const result = await database.execute('PRAGMA user_version');
-      const version = Number(result.rows[0]?.user_version ?? 0);
+      let version = Number(result.rows[0]?.user_version ?? 0);
       if (version === 1) {
         await migrateV1ToV2(database);
-      } else if (version !== 2) {
+        version = 2;
+      }
+      if (version === 2) {
+        await database.transaction(async transaction => {
+          await createDeviceHealthTables(transaction);
+          await transaction.execute('PRAGMA user_version = 3');
+        });
+        version = 3;
+      }
+      if (version === 3) {
+        await database.transaction(async transaction => {
+          await createConflictTables(transaction);
+          await transaction.execute('PRAGMA user_version = 4');
+        });
+        version = 4;
+      }
+      if (version !== 4) {
         throw new Error(`Unsupported health database version ${version}.`);
       }
     })().catch(error => {
@@ -612,13 +647,15 @@ async function getReadyDatabase(): Promise<DB> {
 async function seedUserData(user: AuthUser): Promise<HealthDataPayload> {
   const database = await getReadyDatabase();
   const payload = await getAllHealthData(user.id);
+  // Steps, sleep and calories come from Health Connect, not the API.
+  const apiOwnedPayload = applyDeviceMetrics(payload, []);
   await database.transaction(async transaction => {
-    await writePayloadRows(transaction, user, payload, nowIso());
+    await writePayloadRows(transaction, user, apiOwnedPayload, nowIso());
     for (const record of payload.logMetric.history.filter(item => !item.syncStatus)) {
       await insertOutboxOperation(transaction, user.id, record.id, 'upsert', record.createdAt);
     }
   });
-  return payload;
+  return apiOwnedPayload;
 }
 
 async function loadOptions(
@@ -838,7 +875,10 @@ async function loadPayloadFromRows(
     filters: filters as MeasurementFilter[],
   };
 
-  return { today, logMetric, analytics };
+  return applyDeviceMetrics(
+    { today, logMetric, analytics },
+    await loadDeviceMetricRows(database, userId),
+  );
 }
 
 export async function loadHealthDataForUser(user: AuthUser): Promise<LoadedHealthData> {
@@ -848,11 +888,7 @@ export async function loadHealthDataForUser(user: AuthUser): Promise<LoadedHealt
     await seedUserData(user);
   }
   const payload = await loadPayloadFromRows(database, user.id);
-  const pending = await database.execute(
-    'SELECT COUNT(*) AS count FROM sync_outbox WHERE user_id = ?',
-    [user.id],
-  );
-  return { payload, pendingCount: Number(pending.rows[0]?.count ?? 0) };
+  return { payload, pendingCount: await countPendingSync(database, user.id) };
 }
 
 export async function saveUserHealthDataChange(
@@ -890,21 +926,18 @@ export async function saveUserHealthDataChange(
       );
     }
     await insertOutboxOperation(transaction, user.id, change.recordId, change.operation, updatedAt);
+    if (change.metricKey === 'weight' && change.recordType === 'measurement') {
+      await enqueueWriteBack(transaction, user.id, change.recordId, 'weight', change.operation, updatedAt);
+    } else if (change.metricKey === 'water' && change.recordType === 'today') {
+      await enqueueWriteBack(transaction, user.id, change.recordId, 'water', 'upsert', updatedAt);
+    }
   });
-  const pending = await database.execute(
-    'SELECT COUNT(*) AS count FROM sync_outbox WHERE user_id = ?',
-    [user.id],
-  );
-  return Number(pending.rows[0]?.count ?? 0);
+  return countPendingSync(database, user.id);
 }
 
 export async function getPendingSyncCount(userId: string): Promise<number> {
   const database = await getReadyDatabase();
-  const pending = await database.execute(
-    'SELECT COUNT(*) AS count FROM sync_outbox WHERE user_id = ?',
-    [userId],
-  );
-  return Number(pending.rows[0]?.count ?? 0);
+  return countPendingSync(database, userId);
 }
 
 export async function getPendingSyncChanges(userId: string): Promise<PendingSyncChange[]> {
@@ -914,17 +947,28 @@ export async function getPendingSyncChanges(userId: string): Promise<PendingSync
      FROM sync_outbox WHERE user_id = ? ORDER BY created_at`,
     [userId],
   );
-  return result.rows.map(row => ({
+  const changes: PendingSyncChange[] = result.rows.map(row => ({
     operationId: String(row.operation_id),
     recordId: String(row.record_id),
     operation: String(row.operation) as PendingSyncChange['operation'],
     createdAt: String(row.created_at),
   }));
+  const device = await readDeviceSyncState(database, userId);
+  if (device && device.revision > device.syncedRevision) {
+    changes.push({
+      operationId: `${userId}:${deviceChangeRecordId}`,
+      recordId: deviceChangeRecordId,
+      operation: 'upsert',
+      createdAt: String(device.revision),
+    });
+  }
+  return changes;
 }
 
 export async function acknowledgePendingChanges(
   userId: string,
   uploadedChanges: PendingSyncChange[],
+  serverVersions: ReadonlyMap<string, string> = new Map(),
 ): Promise<LoadedHealthData | null> {
   const database = await getReadyDatabase();
   const userResult = await database.execute('SELECT user_id FROM local_users WHERE user_id = ?', [userId]);
@@ -933,6 +977,14 @@ export async function acknowledgePendingChanges(
   }
   await database.transaction(async transaction => {
     for (const change of uploadedChanges) {
+      if (change.recordId === deviceChangeRecordId) {
+        await transaction.execute(
+          `UPDATE device_sync_state SET synced_revision = MAX(synced_revision, ?)
+           WHERE user_id = ?`,
+          [Number(change.createdAt), userId],
+        );
+        continue;
+      }
       const queuedResult = await transaction.execute(
         `SELECT operation_id FROM sync_outbox
          WHERE user_id = ? AND operation_id = ? AND record_id = ?
@@ -966,9 +1018,9 @@ export async function acknowledgePendingChanges(
           continue;
         }
         await transaction.execute(
-          `UPDATE metric_records SET sync_status = 'synced', server_version = updated_at
+          `UPDATE metric_records SET sync_status = 'synced', server_version = COALESCE(?, updated_at)
            WHERE user_id = ? AND record_id = ?`,
-          [userId, change.recordId],
+          [serverVersions.get(change.recordId) ?? null, userId, change.recordId],
         );
       }
 
@@ -984,4 +1036,634 @@ export async function acknowledgePendingChanges(
     getPendingSyncCount(userId),
   ]);
   return { payload, pendingCount };
+}
+
+interface DeviceSyncState {
+  revision: number;
+  syncedRevision: number;
+  backfilledDays: number;
+  lastImportedAt: string | null;
+}
+
+async function readDeviceSyncState(
+  database: DB,
+  userId: string,
+): Promise<DeviceSyncState | null> {
+  const result = await database.execute(
+    'SELECT revision, synced_revision, backfilled_days, last_imported_at FROM device_sync_state WHERE user_id = ?',
+    [userId],
+  );
+  const row = result.rows[0] as DbRow | undefined;
+  if (!row) {
+    return null;
+  }
+  return {
+    revision: Number(row.revision),
+    syncedRevision: Number(row.synced_revision),
+    backfilledDays: Number(row.backfilled_days),
+    lastImportedAt: nullableText(row, 'last_imported_at') ?? null,
+  };
+}
+
+async function countPendingSync(database: DB, userId: string): Promise<number> {
+  const [outbox, device] = await Promise.all([
+    database.execute('SELECT COUNT(*) AS count FROM sync_outbox WHERE user_id = ?', [userId]),
+    readDeviceSyncState(database, userId),
+  ]);
+  const deviceDirty = device && device.revision > device.syncedRevision ? 1 : 0;
+  return Number(outbox.rows[0]?.count ?? 0) + deviceDirty;
+}
+
+async function loadDeviceMetricRows(database: DB, userId: string): Promise<DeviceMetricRow[]> {
+  const result = await database.execute(
+    'SELECT * FROM device_daily_metrics WHERE user_id = ? AND record_date >= ?',
+    [userId, deviceHistoryStartDate()],
+  );
+  return (result.rows as DbRow[]).map(row => ({
+    metricKey: text(row, 'metric_key') as DeviceMetricKey,
+    date: text(row, 'record_date'),
+    value: numberValue(row, 'value'),
+    deepMinutes: Number(row.deep_minutes ?? 0),
+    remMinutes: Number(row.rem_minutes ?? 0),
+    lightMinutes: Number(row.light_minutes ?? 0),
+    awakeMinutes: Number(row.awake_minutes ?? 0),
+    recordedAt: text(row, 'updated_at'),
+  }));
+}
+
+export interface DeviceImportState {
+  backfilledDays: number;
+  lastImportedAt: string | null;
+}
+
+export async function getDeviceImportState(userId: string): Promise<DeviceImportState> {
+  const database = await getReadyDatabase();
+  const state = await readDeviceSyncState(database, userId);
+  return {
+    backfilledDays: state?.backfilledDays ?? 0,
+    lastImportedAt: state?.lastImportedAt ?? null,
+  };
+}
+
+// Replaces one metric's rows in a date window; returns true when anything differed.
+export async function replaceDeviceDailyMetrics(
+  userId: string,
+  metricKey: DeviceMetricKey,
+  startDate: string,
+  endDate: string,
+  values: DeviceDailyValue[],
+): Promise<boolean> {
+  const database = await getReadyDatabase();
+  let changed = false;
+  await database.transaction(async transaction => {
+    const existingResult = await transaction.execute(
+      `SELECT * FROM device_daily_metrics
+       WHERE user_id = ? AND metric_key = ? AND record_date >= ? AND record_date <= ?`,
+      [userId, metricKey, startDate, endDate],
+    );
+    const existing = new Map(
+      (existingResult.rows as DbRow[]).map(row => [text(row, 'record_date'), row]),
+    );
+    const incoming = new Map(
+      values
+        .filter(item => item.value > 0 && item.date >= startDate && item.date <= endDate)
+        .map(item => [item.date, item]),
+    );
+
+    for (const date of existing.keys()) {
+      if (!incoming.has(date)) {
+        await transaction.execute(
+          `DELETE FROM device_daily_metrics
+           WHERE user_id = ? AND metric_key = ? AND record_date = ?`,
+          [userId, metricKey, date],
+        );
+        changed = true;
+      }
+    }
+
+    for (const [date, item] of incoming) {
+      const previous = existing.get(date);
+      const same = previous !== undefined
+        && Number(previous.value) === item.value
+        && Number(previous.deep_minutes ?? 0) === (item.deepMinutes ?? 0)
+        && Number(previous.rem_minutes ?? 0) === (item.remMinutes ?? 0)
+        && Number(previous.light_minutes ?? 0) === (item.lightMinutes ?? 0)
+        && Number(previous.awake_minutes ?? 0) === (item.awakeMinutes ?? 0);
+      if (same) {
+        continue;
+      }
+      await transaction.execute(
+        `INSERT OR REPLACE INTO device_daily_metrics
+          (user_id, metric_key, record_date, value, deep_minutes, rem_minutes,
+           light_minutes, awake_minutes, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          userId,
+          metricKey,
+          date,
+          item.value,
+          item.deepMinutes ?? null,
+          item.remMinutes ?? null,
+          item.lightMinutes ?? null,
+          item.awakeMinutes ?? null,
+          nowIso(),
+        ],
+      );
+      changed = true;
+    }
+
+    if (changed) {
+      await transaction.execute('INSERT OR IGNORE INTO device_sync_state (user_id) VALUES (?)', [userId]);
+      await transaction.execute(
+        'UPDATE device_sync_state SET revision = revision + 1 WHERE user_id = ?',
+        [userId],
+      );
+    }
+  });
+  return changed;
+}
+
+export async function recordDeviceImport(userId: string, backfilledDays: number): Promise<void> {
+  const database = await getReadyDatabase();
+  await database.transaction(async transaction => {
+    await transaction.execute('INSERT OR IGNORE INTO device_sync_state (user_id) VALUES (?)', [userId]);
+    await transaction.execute(
+      `UPDATE device_sync_state
+       SET backfilled_days = MAX(backfilled_days, ?), last_imported_at = ?
+       WHERE user_id = ?`,
+      [backfilledDays, nowIso(), userId],
+    );
+  });
+}
+
+export interface PendingWriteBack {
+  operationId: string;
+  recordId: string;
+  kind: 'weight' | 'water';
+  operation: 'upsert' | 'delete';
+  createdAt: string;
+}
+
+export interface WriteBackSource {
+  value: number;
+  recordDate: string;
+  recordedAt: string | null;
+  deleted: boolean;
+}
+
+async function enqueueWriteBack(
+  transaction: HealthDbTransaction,
+  userId: string,
+  recordId: string,
+  kind: PendingWriteBack['kind'],
+  operation: PendingWriteBack['operation'],
+  createdAt: string,
+): Promise<void> {
+  await transaction.execute(
+    `INSERT OR REPLACE INTO health_connect_writeback
+      (operation_id, user_id, record_id, kind, operation, created_at, attempt_count, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
+    [`${userId}:${recordId}`, userId, recordId, kind, operation, createdAt],
+  );
+}
+
+export async function getPendingWriteBacks(userId: string): Promise<PendingWriteBack[]> {
+  const database = await getReadyDatabase();
+  const result = await database.execute(
+    `SELECT operation_id, record_id, kind, operation, created_at
+     FROM health_connect_writeback WHERE user_id = ? ORDER BY created_at`,
+    [userId],
+  );
+  return (result.rows as DbRow[]).map(row => ({
+    operationId: text(row, 'operation_id'),
+    recordId: text(row, 'record_id'),
+    kind: text(row, 'kind') as PendingWriteBack['kind'],
+    operation: text(row, 'operation') as PendingWriteBack['operation'],
+    createdAt: text(row, 'created_at'),
+  }));
+}
+
+export async function loadWriteBackSource(
+  userId: string,
+  recordId: string,
+): Promise<WriteBackSource | null> {
+  const database = await getReadyDatabase();
+  const result = await database.execute(
+    `SELECT value, record_date, recorded_at, deleted_at FROM metric_records
+     WHERE user_id = ? AND record_id = ?`,
+    [userId, recordId],
+  );
+  const row = result.rows[0] as DbRow | undefined;
+  if (!row || row.value === null || row.value === undefined) {
+    return null;
+  }
+  return {
+    value: Number(row.value),
+    recordDate: text(row, 'record_date'),
+    recordedAt: nullableText(row, 'recorded_at') ?? null,
+    deleted: row.deleted_at !== null && row.deleted_at !== undefined,
+  };
+}
+
+// Keeps the row when a newer edit replaced this operation while it was in flight.
+export async function completeWriteBack(operation: PendingWriteBack): Promise<void> {
+  const database = await getReadyDatabase();
+  await database.execute(
+    'DELETE FROM health_connect_writeback WHERE operation_id = ? AND created_at = ?',
+    [operation.operationId, operation.createdAt],
+  );
+}
+
+export async function failWriteBack(operationId: string, message: string): Promise<void> {
+  const database = await getReadyDatabase();
+  await database.execute(
+    `UPDATE health_connect_writeback
+     SET attempt_count = attempt_count + 1, last_error = ? WHERE operation_id = ?`,
+    [message, operationId],
+  );
+}
+
+function recordKind(metricKey: string): SyncRecordKind | null {
+  return metricKey === 'weight' || metricKey === 'water' ? metricKey : null;
+}
+
+// Describes each queued edit with the server version it was based on.
+export async function getSyncChangeDetails(
+  userId: string,
+  changes: PendingSyncChange[],
+): Promise<SyncChange[]> {
+  const database = await getReadyDatabase();
+  const details: SyncChange[] = [];
+  for (const change of changes) {
+    if (change.recordId === deviceChangeRecordId) {
+      continue;
+    }
+    const result = await database.execute(
+      `SELECT metric_key, record_date, value, note, recorded_at, server_version
+       FROM metric_records WHERE user_id = ? AND record_id = ?`,
+      [userId, change.recordId],
+    );
+    const row = result.rows[0] as DbRow | undefined;
+    const kind = row ? recordKind(String(row.metric_key)) : null;
+    if (!row || !kind) {
+      continue;
+    }
+    details.push({
+      operationId: change.operationId,
+      recordId: change.recordId,
+      kind,
+      operation: change.operation,
+      baseVersion: nullableText(row, 'server_version') ?? null,
+      date: text(row, 'record_date'),
+      value: row.value === null || row.value === undefined ? null : Number(row.value),
+      note: nullableText(row, 'note') ?? null,
+      measuredAt: kind === 'weight' ? nullableText(row, 'recorded_at') ?? null : null,
+    });
+  }
+  return details;
+}
+
+async function applyServerState(
+  transaction: HealthDbTransaction,
+  userId: string,
+  kind: SyncRecordKind,
+  recordId: string,
+  date: string,
+  state: ServerRecordState,
+  version: string,
+): Promise<void> {
+  const now = nowIso();
+  if (kind === 'weight') {
+    if (state.deleted) {
+      await transaction.execute(
+        'DELETE FROM metric_records WHERE user_id = ? AND record_id = ?',
+        [userId, recordId],
+      );
+      await enqueueWriteBack(transaction, userId, recordId, 'weight', 'delete', now);
+      return;
+    }
+    if (state.value === null) {
+      return;
+    }
+    const existing = await transaction.execute(
+      'SELECT recorded_at, created_at FROM metric_records WHERE user_id = ? AND record_id = ?',
+      [userId, recordId],
+    );
+    const row = existing.rows[0] as DbRow | undefined;
+    await writeMetricRecord(transaction, {
+      userId,
+      recordId,
+      metricKey: 'weight',
+      recordType: 'measurement',
+      recordDate: date,
+      value: state.value,
+      unit: 'kg',
+      note: state.note ?? '',
+      updatedAt: now,
+      syncStatus: 'synced',
+      recordedAt: state.measuredAt ?? (row ? nullableText(row, 'recorded_at') : undefined) ?? now,
+      createdAt: (row ? nullableText(row, 'created_at') : undefined) ?? now,
+      source: 'manual',
+    });
+    await enqueueWriteBack(transaction, userId, recordId, 'weight', 'upsert', now);
+  } else {
+    if (state.value === null) {
+      return;
+    }
+    await transaction.execute(
+      `UPDATE metric_records SET value = ?, sync_status = 'synced', updated_at = ?
+       WHERE user_id = ? AND record_id = ?`,
+      [state.value, now, userId, recordId],
+    );
+    await enqueueWriteBack(transaction, userId, recordId, 'water', 'upsert', now);
+  }
+  await transaction.execute(
+    'UPDATE metric_records SET server_version = ? WHERE user_id = ? AND record_id = ?',
+    [version, userId, recordId],
+  );
+}
+
+// Returns false when the local record is gone, so the caller keeps the queued change.
+async function storeConflict(
+  transaction: HealthDbTransaction,
+  userId: string,
+  recordId: string,
+  localOperation: 'upsert' | 'delete',
+  server: ServerRecordState,
+  serverVersion: string,
+): Promise<boolean> {
+  const local = await transaction.execute(
+    `SELECT metric_key, record_date, value, note, recorded_at
+     FROM metric_records WHERE user_id = ? AND record_id = ?`,
+    [userId, recordId],
+  );
+  const row = local.rows[0] as DbRow | undefined;
+  const kind = row ? recordKind(String(row.metric_key)) : null;
+  if (!row || !kind) {
+    return false;
+  }
+  await transaction.execute(
+    `INSERT OR REPLACE INTO sync_conflicts
+      (user_id, record_id, kind, record_date, local_operation, local_value, local_note,
+       local_measured_at, server_value, server_note, server_measured_at, server_deleted,
+       server_version, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      userId,
+      recordId,
+      kind,
+      text(row, 'record_date'),
+      localOperation,
+      row.value === null || row.value === undefined ? null : Number(row.value),
+      nullableText(row, 'note') ?? null,
+      kind === 'weight' ? nullableText(row, 'recorded_at') ?? null : null,
+      server.value,
+      server.note ?? null,
+      server.measuredAt ?? null,
+      server.deleted ? 1 : 0,
+      serverVersion,
+      nowIso(),
+    ],
+  );
+  await transaction.execute(
+    `UPDATE metric_records SET sync_status = 'conflict' WHERE user_id = ? AND record_id = ?`,
+    [userId, recordId],
+  );
+  return true;
+}
+
+// Conflicted edits leave the outbox; they are re-queued only if the user keeps their version.
+export async function recordSyncConflicts(
+  userId: string,
+  conflicts: { change: PendingSyncChange; result: SyncRecordResult }[],
+): Promise<void> {
+  if (!conflicts.length) {
+    return;
+  }
+  const database = await getReadyDatabase();
+  await database.transaction(async transaction => {
+    for (const { change, result } of conflicts) {
+      const queued = await transaction.execute(
+        'SELECT operation_id FROM sync_outbox WHERE operation_id = ? AND created_at = ?',
+        [change.operationId, change.createdAt],
+      );
+      if (!queued.rows.length || !result.server) {
+        continue;
+      }
+      const stored = await storeConflict(
+        transaction,
+        userId,
+        change.recordId,
+        change.operation,
+        result.server,
+        result.version ?? 'unknown',
+      );
+      if (stored) {
+        await transaction.execute(
+          'DELETE FROM sync_outbox WHERE operation_id = ? AND created_at = ?',
+          [change.operationId, change.createdAt],
+        );
+      }
+    }
+  });
+}
+
+export async function getServerCursor(userId: string): Promise<string | null> {
+  const database = await getReadyDatabase();
+  const result = await database.execute(
+    'SELECT cursor FROM server_sync_state WHERE user_id = ?',
+    [userId],
+  );
+  const row = result.rows[0] as DbRow | undefined;
+  return row ? nullableText(row, 'cursor') ?? null : null;
+}
+
+async function applyOneServerChange(
+  transaction: HealthDbTransaction,
+  userId: string,
+  change: ServerChange,
+): Promise<boolean> {
+  const local = await transaction.execute(
+    'SELECT server_version FROM metric_records WHERE user_id = ? AND record_id = ?',
+    [userId, change.recordId],
+  );
+  const localRow = local.rows[0] as DbRow | undefined;
+  if (!localRow && change.kind === 'water') {
+    return false;
+  }
+  const pending = await transaction.execute(
+    'SELECT operation FROM sync_outbox WHERE user_id = ? AND record_id = ?',
+    [userId, change.recordId],
+  );
+  const openConflict = await transaction.execute(
+    'SELECT record_id FROM sync_conflicts WHERE user_id = ? AND record_id = ?',
+    [userId, change.recordId],
+  );
+  const decision = decideServerChange({
+    hasPendingLocal: pending.rows.length > 0,
+    hasOpenConflict: openConflict.rows.length > 0,
+    localVersion: localRow ? nullableText(localRow, 'server_version') ?? null : null,
+    serverVersion: change.version,
+  });
+
+  if (decision === 'apply') {
+    await applyServerState(
+      transaction,
+      userId,
+      change.kind,
+      change.recordId,
+      change.date,
+      change,
+      change.version,
+    );
+    return true;
+  }
+  if (decision === 'ignore') {
+    return false;
+  }
+
+  if (openConflict.rows.length) {
+    await transaction.execute(
+      `UPDATE sync_conflicts
+       SET server_value = ?, server_note = ?, server_measured_at = ?, server_deleted = ?,
+           server_version = ?
+       WHERE user_id = ? AND record_id = ?`,
+      [
+        change.value,
+        change.note ?? null,
+        change.measuredAt ?? null,
+        change.deleted ? 1 : 0,
+        change.version,
+        userId,
+        change.recordId,
+      ],
+    );
+    return true;
+  }
+
+  const operation = pending.rows[0]
+    ? (String(pending.rows[0].operation) as 'upsert' | 'delete')
+    : 'upsert';
+  const stored = await storeConflict(
+    transaction,
+    userId,
+    change.recordId,
+    operation,
+    change,
+    change.version,
+  );
+  if (stored) {
+    await transaction.execute(
+      'DELETE FROM sync_outbox WHERE user_id = ? AND record_id = ?',
+      [userId, change.recordId],
+    );
+  }
+  return stored;
+}
+
+// Returns how many records changed locally or became conflicts.
+export async function applyServerChanges(
+  userId: string,
+  response: ServerChangesResponse,
+): Promise<number> {
+  const database = await getReadyDatabase();
+  const user = await database.execute('SELECT user_id FROM local_users WHERE user_id = ?', [userId]);
+  if (!user.rows.length) {
+    return 0;
+  }
+  let affected = 0;
+  await database.transaction(async transaction => {
+    for (const change of response.changes) {
+      if (await applyOneServerChange(transaction, userId, change)) {
+        affected += 1;
+      }
+    }
+    await transaction.execute(
+      'INSERT OR REPLACE INTO server_sync_state (user_id, cursor) VALUES (?, ?)',
+      [userId, response.cursor],
+    );
+  });
+  return affected;
+}
+
+export async function getOpenConflicts(userId: string): Promise<SyncConflictItem[]> {
+  const database = await getReadyDatabase();
+  const result = await database.execute(
+    'SELECT * FROM sync_conflicts WHERE user_id = ? ORDER BY created_at',
+    [userId],
+  );
+  return (result.rows as DbRow[]).map(row => ({
+    recordId: text(row, 'record_id'),
+    kind: text(row, 'kind') as SyncRecordKind,
+    date: text(row, 'record_date'),
+    localOperation: text(row, 'local_operation') as 'upsert' | 'delete',
+    local: {
+      value: row.local_value === null || row.local_value === undefined ? null : Number(row.local_value),
+      note: nullableText(row, 'local_note') ?? null,
+      measuredAt: nullableText(row, 'local_measured_at') ?? null,
+    },
+    server: {
+      value: row.server_value === null || row.server_value === undefined ? null : Number(row.server_value),
+      note: nullableText(row, 'server_note') ?? null,
+      measuredAt: nullableText(row, 'server_measured_at') ?? null,
+      deleted: Number(row.server_deleted) === 1,
+    },
+    serverVersion: text(row, 'server_version'),
+  }));
+}
+
+export async function resolveSyncConflict(
+  userId: string,
+  recordId: string,
+  choice: ConflictChoice,
+): Promise<void> {
+  const database = await getReadyDatabase();
+  await database.transaction(async transaction => {
+    const result = await transaction.execute(
+      'SELECT * FROM sync_conflicts WHERE user_id = ? AND record_id = ?',
+      [userId, recordId],
+    );
+    const row = result.rows[0] as DbRow | undefined;
+    if (!row) {
+      return;
+    }
+    const now = nowIso();
+    const version = text(row, 'server_version');
+
+    if (choice === 'mine') {
+      // Re-queue on top of the server's version so the next upload is not a conflict again.
+      await transaction.execute(
+        `UPDATE metric_records SET server_version = ?, sync_status = 'pending', updated_at = ?
+         WHERE user_id = ? AND record_id = ?`,
+        [version, now, userId, recordId],
+      );
+      await insertOutboxOperation(
+        transaction,
+        userId,
+        recordId,
+        text(row, 'local_operation') as 'upsert' | 'delete',
+        now,
+      );
+    } else {
+      await applyServerState(
+        transaction,
+        userId,
+        text(row, 'kind') as SyncRecordKind,
+        recordId,
+        text(row, 'record_date'),
+        {
+          value: row.server_value === null || row.server_value === undefined ? null : Number(row.server_value),
+          note: nullableText(row, 'server_note') ?? null,
+          measuredAt: nullableText(row, 'server_measured_at') ?? null,
+          deleted: Number(row.server_deleted) === 1,
+        },
+        version,
+      );
+    }
+
+    await transaction.execute(
+      'DELETE FROM sync_conflicts WHERE user_id = ? AND record_id = ?',
+      [userId, recordId],
+    );
+  });
 }

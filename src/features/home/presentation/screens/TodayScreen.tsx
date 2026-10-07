@@ -18,6 +18,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { AppHeader } from '../../../../shared/components/AppHeader/AppHeader';
 import { GoalProgressRings } from '../../../../shared/components/GoalProgressRings/GoalProgressRings';
+import { HealthConnectBanner } from '../../../../shared/components/HealthConnectBanner/HealthConnectBanner';
+import { SyncConflictBanner } from '../../../../shared/components/SyncConflictBanner/SyncConflictBanner';
 import { TodayMetricCard } from '../../../../shared/components/TodayMetricCard/TodayMetricCard';
 import { useTodayViewModel } from '../hooks/useTodayViewModel';
 
@@ -108,6 +110,15 @@ export function TodayScreen() {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
+        <HealthConnectBanner
+          status={viewModel.healthConnectStatus}
+          onConnect={viewModel.connectHealthConnect}
+        />
+        <SyncConflictBanner
+          conflict={viewModel.syncConflict}
+          remaining={viewModel.syncConflictCount}
+          onResolve={viewModel.resolveSyncConflict}
+        />
         <View style={styles.dateRow}>
           <Text style={styles.pageTitle}>Today</Text>
           <View style={styles.dateControls}>
